@@ -1,0 +1,787 @@
+<html>
+<head>
+<title>Bouncing balls</title>
+<meta http-equiv="content-type" content="text/html; charset=ISO-8859-1">
+
+<script type="text/javascript" src="./keymaster.min.js"></script>
+<script type="text/javascript" src="./glMatrix-0.9.6.min.js"></script>
+<script type="text/javascript" src="./webgl-utils.js"></script>
+<script type="text/javascript" src="./coffee-script.js"></script>
+
+<script id="outline-shader-vs" type="x-shader/x-vertex">
+    attribute vec3 a_vertex_position;
+
+    uniform mat4 u_mv_mat;
+    uniform mat4 u_p_mat;
+
+    void main(void)
+    {
+        gl_Position = u_p_mat * u_mv_mat * vec4(a_vertex_position, 1.0);
+    }
+</script>
+
+<script id="outline-shader-fs" type="x-shader/x-fragment">
+    #ifdef GL_ES
+    precision highp float;
+    #endif
+
+    uniform vec3 u_color;
+    uniform float u_alpha;
+    void main(void)
+    {
+        gl_FragColor = vec4(u_color, u_alpha);
+    }
+</script>
+
+<script id="shader-vs" type="x-shader/x-vertex">
+    attribute vec3 a_vertex_position;
+    attribute vec3 a_vertex_normal;
+    attribute vec2 a_tex_coord;
+
+    uniform mat4 u_mv_mat;
+    uniform mat4 u_p_mat;
+    uniform mat3 u_n_mat;
+
+    varying vec4 v_position;
+    varying vec3 v_transformed_normal;
+    varying vec2 v_tex_coord;
+
+    void main(void)
+    {
+        v_position = u_mv_mat * vec4(a_vertex_position, 1.0);
+        gl_Position = u_p_mat * u_mv_mat * vec4(a_vertex_position, 1.0);
+        v_transformed_normal = u_n_mat * a_vertex_normal;
+        v_tex_coord = a_tex_coord;
+    }
+</script>
+
+<script id="shader-fs" type="x-shader/x-fragment">
+    #ifdef GL_ES
+    precision highp float;
+    #endif
+
+    const float SHININESS = 32.0;
+    const vec3 LIGHT_LOCATION = vec3(100.0, 100.0, 300.0);
+    const vec3 SPECULAR_COLOR = vec3(0.9, 0.9, 0.9);
+    const vec3 AMB_COLOR = vec3(0.1, 0.1, 0.1);
+
+    varying vec4 v_position;
+    varying vec3 v_transformed_normal;
+    varying vec2 v_tex_coord;
+
+    uniform vec3 u_color;
+    uniform bool u_use_tex;
+    uniform sampler2D u_tex0;
+    uniform float u_alpha;
+
+    void main(void)
+    {
+        vec3 light_dir = normalize(LIGHT_LOCATION - v_position.xyz);
+        vec3 normal = normalize(v_transformed_normal);
+        vec3 eye_dir = normalize( - v_position.xyz );
+        vec3 reflection_dir = reflect( - light_dir, normal);
+        float specular_light_weighting = pow(max(dot(reflection_dir, eye_dir), 0.0), SHININESS);
+        //float diffuse_light_weighting = max(dot(normal, light_dir), 0.0);
+        float diffuse_light_weighting = abs(dot(normal, light_dir));
+        vec3 light_weighting = AMB_COLOR + SPECULAR_COLOR * specular_light_weighting + u_color * diffuse_light_weighting;
+        vec4 frag_color;
+        if ( u_use_tex )
+            frag_color = texture2D(u_tex0, vec2(v_tex_coord.s, v_tex_coord.t));
+        else
+            frag_color = vec4(1.0, 1.0, 1.0, u_alpha);
+        gl_FragColor = vec4(frag_color.rgb*light_weighting, frag_color.a);
+    }
+</script>
+
+<script type="text/coffeescript">
+floor = Math.floor
+random = Math.random
+PI = Math.PI
+sin = Math.sin
+cos = Math.cos
+PI_BY_180 = PI/180
+
+gl = null
+
+# shader for drawing the balls and the cube
+g_shader = null
+# shader for drawing the outline of the cube
+g_outline_shader = null
+# the current shader
+g_cur_shader = null
+
+# Rotation matrix( part of the modelview ) for
+# rotating the cube about the world x and y axes
+g_rot_mat = null
+# perspective, modelview and normal matrices
+g_persp_mat = g_mv_mat = g_mv_mat0 = g_n_mat = null
+
+g_balls_num = 8
+g_balls = []
+#g_planes = []
+g_cube = null
+g_cube_side = 10
+# angle to rotate the cube with on
+# pressing the arrow keys
+g_rot_angle = {"left" : 2*PI_BY_180, "a" : 2*PI_BY_180, "right" : -2*PI_BY_180, "d" : -2*PI_BY_180, "up" : 2*PI_BY_180, "w" : 2*PI_BY_180, "down" : -2*PI_BY_180, "s" : -2*PI_BY_180 }
+g_scene_redraw = false
+g_mv_mat_stack = []
+g_animating = false
+# time step
+g_dt = 0.02
+
+randomI = (min_val, max_val) ->
+    min_val + floor(random()*(max_val + 1 - min_val))
+
+randomF = (min_val, max_val) ->
+    min_val + random()*(max_val - min_val)
+
+bindElementBuffers = (buf_array) ->
+    index_buffer = buf_array[0]
+    gl.bindBuffer(index_buffer._type, index_buffer._buffer)
+    for b in buf_array[1..]
+        gl.bindBuffer(b._type, b._buffer)
+        gl.vertexAttribPointer(g_cur_shader[b._attribute], b._item_size, gl.FLOAT, false, 0, 0)
+
+bindArrayBuffers = (buf_array) ->
+    for b in buf_array
+        gl.bindBuffer(b._type, b._buffer)
+        gl.vertexAttribPointer(g_cur_shader[b._attribute], b._item_size, gl.FLOAT, false, 0, 0)
+
+# Returns a function that binds the buffers passed in buf_array
+# before calling draw_fn
+bindAndDrawElements = (draw_fn) ->
+    ( buf_array, primitive) ->
+        bindElementBuffers(buf_array)
+        draw_fn(buf_array, primitive)
+
+# Returns a function that binds the buffers passed in buf_array
+# before calling draw_fn
+bindAndDrawArrays = (draw_fn) ->
+    ( buf_array, primitive) ->
+        bindArrayBuffers(buf_array)
+        draw_fn(buf_array, primitive)
+
+drawElements = (buf_array, primitive) ->
+    gl.drawElements(primitive, buf_array[0]._num_items, gl.UNSIGNED_SHORT, 0)
+
+drawArrays = (buf_array, primitive) ->
+    gl.drawArrays(primitive, 0, buf_array[0]._num_items)
+
+# Encapsulation of a buffer object
+class Buffer
+    constructor: (@_attribute, data, @_type, @_item_size, @_num_items, draw_type = gl.STATIC_DRAW) ->
+        array_type = switch @_type
+                        when gl.ARRAY_BUFFER then Float32Array
+                        when gl.ELEMENT_ARRAY_BUFFER then Uint16Array
+        @_data_array = new array_type(data)
+        @_buffer = gl.createBuffer()
+        gl.bindBuffer(@_type, @_buffer)
+        gl.bufferData(@_type, @_data_array, draw_type)
+
+    updateData: (data) ->
+        gl.bindBuffer(@_type, @_buffer)
+        @_data_array.set(data)
+        gl.bufferSubData(@_type, 0, @_data_array)
+
+class Object3D
+    constructor: ({ vertices, normals, indices, vertex_colors, tex_coords, shared_buffers_array }) ->
+            @color ?= [ 1.0, 1.0, 1.0 ]
+            @opacity ?= 1.0
+            if not shared_buffers_array?
+                @buffers_array = []
+                if indices?
+                    @buffers_array.push(@index_buffer = new Buffer('', indices, gl.ELEMENT_ARRAY_BUFFER, 1, indices.length))
+                if vertices?
+                    @buffers_array.push(@vertex_buffer = new Buffer('a_vertex_position', vertices, gl.ARRAY_BUFFER, 3, vertices.length/3))
+                else
+                    throw "No vertices"
+                if normals?
+                    @buffers_array.push(@normals_buffer = new Buffer('a_vertex_normal', normals, gl.ARRAY_BUFFER, 3, normals.length/3))
+                if vertex_colors?
+                    @buffers_array.push(@colors_buffer = new Buffer('a_vertex_color', vertex_colors, gl.ARRAY_BUFFER, 4, vertex_colors.length/4 ))
+                if @texture?
+                    @buffers_array.push(@texture_buffer = new Buffer('a_tex_coord', tex_coords, gl.ARRAY_BUFFER, 2, tex_coords.length/2))
+            else
+                @buffers_array = shared_buffers_array
+
+            if @buffers_array[0]._attribute is ''
+                @drawItems = drawElements
+                if not shared_buffers_array?
+                    @drawItems = bindAndDrawElements(@drawItems)
+            else
+                @drawItems = drawArrays
+                if not shared_buffers_array?
+                    @drawItems = bindAndDrawArrays(@drawItems)
+            @drawUnblended = if @texture?
+                                @drawTextured
+                            else
+                                @drawPlain
+            @draw = if @opacity < 1.0 then @drawBlended else @drawUnblended
+
+    drawTextured: ->
+        gl.enableVertexAttribArray(g_cur_shader["a_tex_coord"])
+        gl.activeTexture(gl.TEXTURE0)
+        gl.bindTexture(gl.TEXTURE_2D, @texture)
+        setUniforms("u_tex0", 0, "u_use_tex", 1)
+        setUniforms('u_mv_mat', g_mv_mat, 'u_n_mat', g_n_mat)
+        @drawItems(@buffers_array, gl.TRIANGLES)
+
+    drawPlain: ->
+        gl.disableVertexAttribArray(g_cur_shader["a_tex_coord"])
+        setUniforms("u_use_tex", 0, "u_color", @color, "u_alpha", @opacity)
+        setUniforms('u_mv_mat', g_mv_mat, 'u_n_mat', g_n_mat)
+        @drawItems(@buffers_array, gl.TRIANGLES)
+
+    drawBlended: ->
+        gl.disable(gl.CULL_FACE)
+        gl.depthMask(false)
+        gl.enable(gl.BLEND)
+        @drawUnblended()
+        gl.disable(gl.BLEND)
+        gl.depthMask(true)
+        gl.enable(gl.CULL_FACE)
+
+class Cube extends Object3D
+    constructor: (side, { @color, @opacity, @texture } = {}) ->
+        half_side = side/2
+        vertices = [
+                     # right
+                     half_side, half_side, half_side
+                     half_side, -half_side, half_side
+                     half_side, -half_side, -half_side
+                     half_side, half_side, -half_side
+
+                     # left
+                     -half_side, half_side, -half_side
+                     -half_side, -half_side, -half_side
+                     -half_side, -half_side, half_side
+                     -half_side, half_side, half_side
+
+                     # front
+                     -half_side, half_side, half_side
+                     -half_side, -half_side, half_side
+                     half_side, -half_side, half_side
+                     half_side, half_side, half_side
+
+                     # back
+                     half_side, half_side, -half_side
+                     half_side, -half_side, -half_side
+                     -half_side, -half_side, -half_side
+                     -half_side, half_side, -half_side
+
+                     # top
+                     -half_side, half_side, -half_side
+                     -half_side, half_side, half_side
+                     half_side, half_side, half_side
+                     half_side, half_side, -half_side
+
+                     # bottom
+                     -half_side, -half_side, half_side
+                     -half_side, -half_side, -half_side
+                     half_side, -half_side, -half_side
+                     half_side, -half_side, half_side ]
+        normals = [
+                    1, 0, 0
+                    1, 0, 0
+                    1, 0, 0
+                    1, 0, 0
+
+                    -1, 0, 0
+                    -1, 0, 0
+                    -1, 0, 0
+                    -1, 0, 0
+
+                    0, 0, 1
+                    0, 0, 1
+                    0, 0, 1
+                    0, 0, 1
+
+                    0, 0, -1
+                    0, 0, -1
+                    0, 0, -1
+                    0, 0, -1
+
+                    0, 1, 0
+                    0, 1, 0
+                    0, 1, 0
+                    0, 1, 0
+
+                    0, -1, 0
+                    0, -1, 0
+                    0, -1, 0
+                    0, -1, 0 ]
+        tex_coords = [
+                       0, 1
+                       0, 0
+                       1, 0
+                       1, 1
+
+                       0, 1
+                       0, 0
+                       1, 0
+                       1, 1
+
+                       0, 1
+                       0, 0
+                       1, 0
+                       1, 1
+
+                       0, 1
+                       0, 0
+                       1, 0
+                       1, 1
+
+                       0, 1
+                       0, 0
+                       1, 0
+                       1, 1
+
+                       0, 1
+                       0, 0
+                       1, 0
+                       1, 1 ]
+        indices = [
+                    0, 1, 3, 3, 1, 2
+                    4, 5, 7, 7, 5, 6
+                    8, 9, 11, 11, 9, 10
+                    12, 13, 15, 15, 13, 14
+                    16, 17, 19, 19, 17, 18
+                    20, 21, 23, 23, 21, 22 ]
+        outline_indices = [
+                            0, 1, 1, 2, 2, 3, 3, 0
+                            4, 5, 5, 6, 6, 7, 7, 4
+                            9, 10, 11, 8
+                            13, 14, 15, 12 ]
+        super({ vertices, normals, indices, tex_coords })
+        @outline_index_buffer = new Buffer('', outline_indices, gl.ELEMENT_ARRAY_BUFFER, 1, outline_indices.length)
+        @outline_buf_array = [@outline_index_buffer, @vertex_buffer]
+
+    drawOutline: (outline_color, outline_opacity)->
+        setUniforms("u_color", outline_color, "u_alpha", outline_opacity)
+        setUniforms('u_mv_mat', g_mv_mat)
+        bindElementBuffers(@outline_buf_array)
+        drawElements(@outline_buf_array, gl.LINES)
+        return
+
+class Plane extends Object3D
+    constructor: (corners, horiz_divs, vert_divs, { @color, @opacity, @texture } = {}) ->
+        horiz_seprn = vec3.scale(vec3.subtract(corners[3], corners[0], vec3.create()), 1/horiz_divs)
+        vert_seprn = vec3.scale(vec3.subtract(corners[1], corners[0], vec3.create()), 1/vert_divs)
+        v1 = vec3.subtract(corners[0], corners[1], vec3.create())
+        v2 = vec3.subtract(corners[2], corners[1], vec3.create())
+        normal = vec3.normalize(vec3.cross(v1, v2, vec3.create()))
+        vertices = []
+        normals = []
+        tex_coords = []
+        for r in [0..vert_divs]
+            down_shift = vec3.scale(vert_seprn, r, vec3.create())
+            left_most = vec3.add(corners[0], down_shift, vec3.create())
+            v = 1.0 - r/vert_divs
+            for c in [0..horiz_divs]
+                right_shift = vec3.scale(horiz_seprn, c, vec3.create())
+                vertex = vec3.add(left_most, right_shift, vec3.create())
+                vertices.push(vertex[0], vertex[1], vertex[2])
+                normals.push(normal[0], normal[1], normal[2])
+                u = c/horiz_divs
+                tex_coords.push(u,v)
+        indices = []
+        for r in [0...vert_divs]
+            for c in [0...horiz_divs]
+                first = r*(horiz_divs + 1) + c
+                second = first + horiz_divs + 1
+                indices.push(first, second, first + 1, second, second + 1, first + 1)
+        super({ vertices, normals, indices, tex_coords })
+
+sphereBuffers = (latitudes, longitudes, radius, textured = false) ->
+    vertices = []
+    normals = []
+    tex_coords = []
+    theta_inc = PI/latitudes
+    for lat_number in [0..latitudes]
+        theta = lat_number * theta_inc
+        sin_theta = sin(theta)
+        cos_theta = cos(theta)
+        phi_inc = 2*PI/longitudes
+        v = 1 - lat_number/latitudes
+        for long_number in [0..longitudes]
+            phi = long_number * phi_inc
+            sin_phi = sin(phi)
+            cos_phi = cos(phi)
+            x = sin_phi * sin_theta
+            y = cos_theta
+            z = cos_phi * sin_theta
+            u = 1 - long_number/longitudes
+            normals.push(x, y, z)
+            tex_coords.push(u,v)
+            vertices.push(radius*x, radius*y, radius*z)
+    indices = []
+    for lat_number in [0...latitudes]
+        for long_number in [0...longitudes]
+            first = lat_number * (longitudes + 1) + long_number
+            second = first + longitudes + 1
+            indices.push(first, second, first + 1, second, second + 1, first + 1)
+    sphere_buffers = []
+    sphere_buffers.push(new Buffer('', indices, gl.ELEMENT_ARRAY_BUFFER, 1, indices.length))
+    sphere_buffers.push(new Buffer('a_vertex_position', vertices, gl.ARRAY_BUFFER, 3, vertices.length/3))
+    sphere_buffers.push(new Buffer('a_vertex_normal', normals, gl.ARRAY_BUFFER, 3, normals.length/3))
+    if textured
+        sphere_buffers.push(new Buffer('a_tex_coord', tex_coords, gl.ARRAY_BUFFER, 2, tex_coords.length/2))
+    sphere_buffers
+
+# This Sphere class makes use of just one set of buffer objects
+# that is shared by all instances. Spheres of different radii are drawn
+# by scaling the modelview matrix by the radius.
+# This also makes it possible to bind the buffers just once before drawing
+# all the spheres as seen in drawScene
+class Sphere extends Object3D
+    @latitudes: 30
+    @longitudes: 30
+    @base_radius: 1.0
+    @sphere_buffers: null
+
+    constructor: ({ @color, @opacity, @texture } = {}) ->
+        if not Sphere.sphere_buffers?
+            Sphere.sphere_buffers = sphereBuffers(Sphere.latitudes, Sphere.longitudes, Sphere.base_radius)
+        super( { shared_buffers_array: Sphere.sphere_buffers })
+
+class Ball
+    @radius_to_mass_factor: 2.0
+    @min_radius: 0.5
+    @max_radius: 2.0
+    @radius_step: 0.25
+    @min_speed: 0.0
+    @max_speed: 8.0
+
+    constructor: (@rad, {color, opacity, texture, @pos, @vel} = {}) ->
+        throw "Ball radius must be specified" if not @rad?
+        @pos ?= vec3.create()
+        @vel ?= vec3.create()
+        @sphere = new Sphere({ color, opacity, texture })
+        @mass = @rad*@rad*@rad*Ball.radius_to_mass_factor
+        half_cube_side = g_cube_side/2
+        @left_bound = @bot_bound = @back_bound = -half_cube_side + @rad
+        @right_bound = @top_bound = @front_bound = half_cube_side - @rad
+        @hit = false
+
+    display: ->
+        pushMvMat()
+        mat4.translate(g_mv_mat, @pos)
+        mat4.scale(g_mv_mat, [@rad, @rad, @rad])
+        @sphere.draw()
+        popMvMat()
+
+    move: (dt) ->
+        vec3.add(@pos, vec3.scale(@vel, dt, vec3.create()))
+
+    hitsWall: ->
+        if ( (@pos[0] < @left_bound and @vel[0] < 0 ) or (@pos[0] > @right_bound and @vel[0] > 0) )
+            @hit = true
+            @vel[0] *= -1.0
+        if ( (@pos[1] < @bot_bound and @vel[1] < 0 ) or (@pos[1] > @top_bound and @vel[1] > 0) )
+            @hit = true
+            @vel[1] *= -1.0
+        if ( (@pos[2] < @back_bound and @vel[2] < 0 ) or (@pos[2] > @front_bound and @vel[2] > 0) )
+            @hit = true
+            @vel[2] *= -1.0
+        return @hit
+
+    hitsBall: (ball) ->
+        if not @overlappingBall(ball)
+            return false
+        pos_diff = vec3.subtract(ball.pos, @pos, vec3.create())
+        pos_diff_sq = vec3.dot(pos_diff, pos_diff)
+        v_dot_diff_by_pos_diff_sq = vec3.dot(@vel, pos_diff)/pos_diff_sq
+        v_n = vec3.scale(pos_diff, v_dot_diff_by_pos_diff_sq, vec3.create())
+        bv_dot_diff_by_pos_diff_sq = vec3.dot(ball.vel, pos_diff)/pos_diff_sq
+        bv_n = vec3.scale(pos_diff, bv_dot_diff_by_pos_diff_sq, vec3.create())
+        vn_diff = vec3.subtract(bv_n, v_n, vec3.create())
+        if vec3.dot(vn_diff, pos_diff) > 0
+            return false
+        v_t = vec3.subtract(@vel, v_n, vec3.create())
+        bv_t = vec3.subtract(ball.vel, bv_n, vec3.create())
+        mass_sum = @mass + ball.mass
+        mass_diff = @mass - ball.mass
+        v_1 = vec3.scale(bv_n, 2*ball.mass/mass_sum, vec3.create())
+        v_2 = vec3.scale(v_n, mass_diff/mass_sum, vec3.create())
+        new_v_n = vec3.add(v_1, v_2, vec3.create())
+        v_1 = vec3.scale(v_n, 2*@mass/mass_sum, vec3.create())
+        v_2 = vec3.scale(bv_n, mass_diff/mass_sum, vec3.create())
+        new_bv_n = vec3.subtract(v_1, v_2, vec3.create())
+        @vel = vec3.add(new_v_n, v_t, vec3.create())
+        ball.vel = vec3.add(new_bv_n, bv_t, vec3.create())
+        @hit = ball.hit = true
+        return true
+
+    overlappingBall: (ball) ->
+        rad_sum = @rad + ball.rad
+        rad_sum_sq = rad_sum * rad_sum
+        pos_diff = vec3.subtract(ball.pos, @pos, vec3.create())
+        if vec3.dot(pos_diff, pos_diff) < rad_sum_sq
+            return true
+        else
+            return false
+
+    overlappingBalls: (balls) ->
+        for ball in balls
+            return true if @overlappingBall(ball)
+        return false
+
+
+elem = (id) -> document.getElementById id
+
+initGL = (canvas) ->
+    try
+        gl = canvas.getContext("experimental-webgl", { alpha: false})
+        gl.viewportWidth = canvas.width
+        gl.viewportHeight = canvas.height
+    catch error
+        console.log error
+    if not gl
+        console.log "Could not initialize WebGl"
+
+
+getShader = (id) ->
+    shader_script = elem(id)
+    if not shader_script
+        return null
+    str = ""
+    k = shader_script.firstChild
+    while k
+        str += k.textContent if k.nodeType == 3
+        k = k.nextSibling
+    if shader_script.type is "x-shader/x-fragment"
+        shader = gl.createShader(gl.FRAGMENT_SHADER)
+    else if shader_script.type is "x-shader/x-vertex"
+        shader = gl.createShader(gl.VERTEX_SHADER)
+    else
+        return null
+    attributes = getAttributes(str)
+    uniforms = getUniforms(str)
+    gl.shaderSource(shader, str)
+    gl.compileShader(shader)
+    if not gl.getShaderParameter(shader, gl.COMPILE_STATUS)
+        alert gl.getShaderInfoLog(shader)
+        return null
+    return [shader, attributes, uniforms]
+
+createProgram = (id_prefix) ->
+    [vert_shader, vert_attributes, vert_uniforms] = getShader("#{id_prefix}-vs")
+    # There are no attributes in the fragment shader and so
+    # frag_attributes will be empty.
+    [frag_shader, frag_attributes, frag_uniforms] = getShader("#{id_prefix}-fs")
+    uniforms = vert_uniforms
+    for own key, val of frag_uniforms
+        uniforms[key] = val
+    attributes = vert_attributes
+    shader_prog = gl.createProgram()
+    gl.attachShader(shader_prog, vert_shader)
+    gl.attachShader(shader_prog, frag_shader)
+    gl.linkProgram(shader_prog)
+    if not gl.getProgramParameter(shader_prog, gl.LINK_STATUS)
+        alert "Could not initialize shaders"
+        return null
+    shader_prog.uniforms = uniforms
+    for attribute in attributes
+        shader_prog[attribute] = gl.getAttribLocation(shader_prog, attribute)
+        gl.enableVertexAttribArray(shader_prog[attribute])
+    for own key, val of shader_prog.uniforms
+        val.location = gl.getUniformLocation(shader_prog, key)
+    return shader_prog
+
+initShaders = ->
+    g_shader = createProgram("shader")
+    g_outline_shader = createProgram("outline-shader")
+    return
+
+switchShader = (shader) ->
+    g_cur_shader = shader
+    gl.useProgram(g_cur_shader)
+
+# Sets up/initializes attributes by reading the shader source
+# Split the shader source at non-word boundaries, look for the 'attribute'
+# string in the array and if found, the name of the attribute will be
+# the element two places after.
+getAttributes = (shader_str) ->
+    words = shader_str.split(/\W/)
+    return (words[word_indx+2] for word, word_indx in words when word is "attribute")
+
+# Sets up/initializes uniforms by reading the shader source
+getUniforms = (shader_str) ->
+    uniforms = {}
+    words = shader_str.split(/\W/)
+    for word, word_indx in words when word is "uniform"
+        uniforms[words[word_indx + 2]] = { type : words[word_indx + 1]}
+    return uniforms
+
+
+setUniformInt = (location, value) ->
+    gl.uniform1i(location, value)
+
+setUniformFloat = (location, value) ->
+    gl.uniform1f(location, value)
+
+setUniformVec3 = (location, value) ->
+    gl.uniform3fv(location, value)
+
+setUniformVec4 = (location, value) ->
+    gl.uniform4fv(location, value)
+
+setUniformMat3 = (location, value) ->
+    gl.uniformMatrix3fv(location, false, value)
+
+setUniformMat4 = (location, value) ->
+    gl.uniformMatrix4fv(location, false, value)
+
+uniform_fns =
+             "int" : setUniformInt
+             "bool" : setUniformInt
+             "sampler2D" : setUniformInt
+             "float" : setUniformFloat
+             "vec3" : setUniformVec3
+             "vec4" : setUniformVec4
+             "mat3" : setUniformMat3
+             "mat4" : setUniformMat4
+
+# setUniforms receives one or more pairs of uniform key and value
+setUniforms = (uniform_key_vals...) ->
+    for uniform_key, indx in uniform_key_vals by 2
+        uniform_obj = g_cur_shader.uniforms[uniform_key]
+        value = uniform_key_vals[indx + 1]
+        uniform_fns[uniform_obj.type](uniform_obj.location, value)
+    return
+
+setPerspective = ->
+    setUniforms("u_p_mat", g_persp_mat)
+
+pushMvMat = ->
+    g_mv_mat_stack.push mat4.create(g_mv_mat)
+
+popMvMat = ->
+    throw "Empty matrix stack" if g_mv_mat_stack.length is 0
+    g_mv_mat = g_mv_mat_stack.pop()
+
+initModelView = ->
+    mat4.multiply(g_mv_mat0, g_rot_mat, g_mv_mat)
+
+updateNormalMat = ->
+    mat4.toInverseMat3(g_mv_mat, g_n_mat)
+    mat3.transpose(g_n_mat)
+
+initObjects = ->
+    rad_steps = (Ball.max_radius - Ball.min_radius)/Ball.radius_step
+    for i in [0...g_balls_num]
+        rad = Ball.min_radius + randomI(1, rad_steps)*Ball.radius_step
+        ball = new Ball( rad, { color : [ Math.random(), Math.random(), Math.random()]})
+        [ ball.pos[0], ball.pos[1], ball.pos[2] ] = [ randomF(ball.left_bound, ball.right_bound),
+                                                      randomF(ball.bot_bound, ball.top_bound),
+                                                      randomF(ball.back_bound, ball.front_bound)]
+        while ball.overlappingBalls(g_balls)
+            [ ball.pos[0], ball.pos[1], ball.pos[2] ] = [ randomF(ball.left_bound, ball.right_bound),
+                                                          randomF(ball.bot_bound, ball.top_bound),
+                                                          randomF(ball.back_bound, ball.front_bound)]
+        speed = randomI(Ball.min_speed, Ball.max_speed)
+        theta = randomI(0, 180)*PI_BY_180
+        phi = randomI(0, 359)*PI_BY_180
+        [ ball.vel[0], ball.vel[1], ball.vel[2] ] = [ speed*cos(phi)*sin(theta),
+                                                      speed*sin(phi)*sin(theta),
+                                                      speed*cos(theta) ]
+        g_balls.push(ball)
+
+    ###
+    g_planes.push(new Plane([[-4, 4, 4], [-4, -4, 4], [4, -4, 4], [4, 4, 4]], 6, 6, [0, 0.9, 0.9]))
+    g_planes.push(new Plane([[4, 4, -4], [4, -4, -4], [-4, -4, -4], [-4, 4, -4]], 6, 6, [0, 0.9, 0.9]))
+    g_planes.push(new Plane([[-4, 4, -4], [-4, -4, -4], [-4, -4, 4], [-4, 4, 4]], 6, 6, [0, 0.9, 0.9]))
+    g_planes.push(new Plane([[4, 4, 4], [4, -4, 4], [4, -4, -4], [4, 4, -4]], 6, 6, [0, 0.9, 0.9]))
+    g_planes.push(new Plane([[-4, 4, -4], [-4, 4, 4], [4, 4, 4], [4, 4, -4]], 6, 6, [0, 0.9, 0.9]))
+    g_planes.push(new Plane([[-4, -4, 4], [-4, -4, -4], [4, -4, -4], [4, -4, 4]], 6, 6, [0, 0.9, 0.9]))
+    plane.opacity = 0.20 for plane in g_planes
+    ###
+    g_cube = new Cube(g_cube_side, { color: [0, 0.9, 0.9], opacity: 0.3 })
+
+onRot = (event, handler) ->
+    sc = handler.shortcut
+    new_rot_mat = mat4.identity(mat4.create())
+    switch sc
+        when "left", "right", "a", "d"
+            mat4.rotateY(new_rot_mat, g_rot_angle[sc])
+        when "up", "down", "w", "s"
+            mat4.rotateX(new_rot_mat, g_rot_angle[sc])
+    mat4.multiply(new_rot_mat, g_rot_mat, g_rot_mat)
+    g_scene_redraw = true
+    return false
+
+tick = ->
+    requestAnimFrame(tick)
+    if  g_animating
+        # first, check for collisions
+        # ignore balls that have already suffered a collision
+        # either with another ball or with the wall
+        for ball, i in g_balls when not ball.hit and not ball.hitsWall()
+            for other_ball in g_balls[i+1...]
+                # we consider only one collision per ball at a time
+                # that is, we do not consider two or more simultaneous collisions on a ball
+                if not other_ball.hit and ball.hitsBall(other_ball)
+                    break
+        # Next, move all the balls to new positions
+        for ball in g_balls
+            ball.move(g_dt)
+            ball.hit = false
+        g_scene_redraw = true
+    drawScene() if g_scene_redraw
+    return
+
+drawScene = ->
+    g_scene_redraw = false
+    initModelView()
+    updateNormalMat()
+    gl.clear( gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT )
+    setPerspective()
+    # Bind the buffer objects just once before drawing all the balls(spheres)
+    # since the spheres share the buffer objects.
+    bindElementBuffers(Sphere.sphere_buffers)
+    for ball in g_balls
+        ball.display()
+    g_cube.draw()
+    switchShader(g_outline_shader)
+    setPerspective()
+    gl.enable(gl.BLEND)
+    g_cube.drawOutline([0.0, 0.9, 0.9], 0.2)
+    gl.disable(gl.BLEND)
+    switchShader(g_shader)
+
+initMats = ->
+    g_mv_mat0 = mat4.identity(mat4.create())
+    mat4.translate(g_mv_mat0, [0.0, 0.0, -16.0])
+    g_mv_mat = mat4.create()
+    g_n_mat = mat3.create()
+    g_persp_mat = mat4.create()
+    mat4.perspective(60, gl.viewportWidth/gl.viewportHeight, 0.1, 5000.0, g_persp_mat)
+    g_rot_mat = mat4.identity(mat4.create())
+
+window.webGLStart = ->
+    canvas = elem("gl_canvas")
+    initGL(canvas)
+    initMats()
+    initShaders()
+    initObjects()
+    key('left, right, up, down, a, d, w, s', onRot)
+    key('space', -> g_animating = !g_animating; false)
+    gl.enable(gl.DEPTH_TEST)
+    gl.depthFunc(gl.LEQUAL)
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
+    gl.enable(gl.CULL_FACE)
+    gl.clearColor(0.0, 0.0, 0.0, 1.0)
+    gl.viewport(0, 0, gl.viewportWidth, gl.viewportHeight)
+    gl.lineWidth(1.0)
+    switchShader(g_shader)
+    drawScene()
+    tick()
+
+</script>
+</head>
+<body onload="webGLStart();">
+    <canvas id="gl_canvas" style="border: 1px solid;" width="600" height="600"></canvas>
+</body>
+</html>
+
